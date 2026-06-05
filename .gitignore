@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+
+# Atlas outputs can be huge; publish schemas/examples, not generated data.
+atlas/
+runs/
+*.sqlite
+*.sqlite-*
+*.npz
+*.npy
+*_census_raw.json
+*_census_raw.jsonl
+*_census_heatmap.png
+*_separation_scores.npy
+
+# Local credentials/env.
+.env
+.env.*
+!.env.example
