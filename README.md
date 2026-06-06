@@ -23,8 +23,10 @@ every time.
 
 The map for Qwen3-8B-Base covers all 36 layers, ~1.84M feature channels across 7 projections,
 plus per-head attention stats, coactivation, and layer-level SAE feature scores (two sparsity
-variants, trained separately and merged in). Every channel index maps 1:1 to a real
-weight-matrix row or column, so a salience score is also a quantization instruction.
+variants, trained separately and merged in — see [event-aware-SAE-trainer](https://github.com/JuiceB0xC0de/event-aware-SAE-trainer)
+if you need to train SAEs for a model that doesn't have them yet). Every channel index maps
+1:1 to a real weight-matrix row or column, so a salience score is also a quantization
+instruction.
 
 ## GWIQ: geometry-weighted informed quantization
 
@@ -134,6 +136,16 @@ Corpus is JSONL; each line needs at least a prompt and a category:
 
 Optional fields (`id`, `bucket`, `subcategory`, `is_contrast`, `contrast_pair_id`) are
 preserved through to the atlas.
+
+## Adding SAE feature scores
+
+A complete atlas includes layer-level SAE feature scores alongside the census. QWIP doesn't
+train the SAEs — it consumes scores trained elsewhere and folds them in with `merge_sae.py`.
+If the model you're atlasing doesn't have SAEs yet, train them with
+[event-aware-SAE-trainer](https://github.com/JuiceB0xC0de/event-aware-SAE-trainer), which
+trains an SAE on every decoder layer in a single unattended run, then merge the resulting
+scores into the atlas. Without this step the atlas still works for census and
+compliance-behaviour queries — the SAE columns just stay empty.
 
 ## The Qwen3-8B-Base atlas
 
