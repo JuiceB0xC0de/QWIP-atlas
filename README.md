@@ -1,4 +1,4 @@
-# QWIP Atlas
+# GWIQ-atlas (Geometry-Weighted Informed Quantization)
 
 Model-agnostic brain-atlasing tools for transformer internals — build a per-layer map of
 what every channel in a language model *does*, and store it somewhere you can query it.
