@@ -50,12 +50,12 @@ simulator (real NF4 codebook, per-64-block absmax) reproduces real bitsandbytes 
 | Config | PPL ↓ | Notes |
 |--------|------:|-------|
 | bf16 (reference) | 6.2192 | unquantized ceiling |
+| **real bnb Q4 (NF4, double-quant)** | **6.5421** | **the bar to beat** |
+| sim-NF4 uniform | 6.5470 | simulator anchor |
 | **GWIQ `p130_m31`** | **6.3897** | **best observed — protect + smart NF4** |
 | GWIQ `protect_smart1230` | 6.3927 | protect mask × smart NF4 |
 | GWIQ `nf4_smart1230` | 6.3999 | smart NF4, no protect mask |
 | GWIQ `atlas_protect` (protect-only) | 6.4301 | first atlas-informed win |
-| **real bnb Q4 (NF4, double-quant)** | **6.5421** | **the bar to beat** |
-| sim-NF4 uniform | 6.5470 | simulator anchor |
 
 GWIQ's best run lands **0.15 PPL below real Q4** (6.3897 vs 6.5421) while keeping effective
 bits in the same neighbourhood. The protect signal is real and consistently useful: every
