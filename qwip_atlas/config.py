@@ -46,3 +46,28 @@ class AtlasRunConfig:
         "v",
     })
     truncate_to_deepest_layer: bool = True
+
+
+@dataclass(frozen=True)
+class ComplianceBehaviourRunConfig:
+    """Config for a binary behavior-axis extraction run."""
+
+    model: ModelSpec
+    positive_corpus: CorpusSpec
+    negative_corpus: CorpusSpec
+    layers: list[int]
+    output: Path
+    batch_size: int = 8
+    components: set[str] = field(default_factory=lambda: {
+        "mlp",
+        "gate",
+        "up",
+        "attn",
+        "heads",
+        "q",
+        "k",
+        "v",
+    })
+    positive_label: str = "positive"
+    negative_label: str = "negative"
+    truncate_to_deepest_layer: bool = True

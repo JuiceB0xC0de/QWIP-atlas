@@ -1,7 +1,7 @@
 [project]
 name = "qwip-atlas"
 version = "0.1.0"
-description = "Model-agnostic brain atlasing tools for transformer activation, bouncer, SAE, and circuit maps."
+description = "Model-agnostic brain atlasing tools for transformer activation, compliance behaviour, SAE, and circuit maps."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,22 +10,30 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-hf = [
+
+# Extra analysis and HF libs for optional installs.
+# Use `pip install -e ".[analysis]"` to add these packages for the analysis scripts.
+analysis = [
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "scipy>=1.13",
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
   "accelerate>=0.34",
   "torch>=2.5",
   "transformers>=4.51",
   "tqdm>=4.66",
-]
-analysis = [
-  "matplotlib>=3.8",
-  "pandas>=2.2",
-  "scikit-learn>=1.5",
-  "scipy>=1.13",
-  "seaborn>=0.13",
+  "sentence-transformers>=2.2",
+  "datasets>=2.11",
+  "tokenizers>=0.15",
 ]
 
 [project.scripts]
 qwip-atlas = "qwip_atlas.cli:main"
+qwip-build-atlas = "qwip_atlas.build_atlas:main"
+qwip-analyze-layer = "qwip_atlas.analyze_layers:main"
+qwip-analyze-compliance-behaviour = "qwip_atlas.analyze_compliance_behaviour:main"
+qwip-merge-sae = "qwip_atlas.merge_sae:main"
 
 [build-system]
 requires = ["hatchling"]
