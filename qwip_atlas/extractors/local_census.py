@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from qwip_atlas.config import AtlasRunConfig
@@ -140,23 +139,18 @@ def _row_from_capture(
         "mean_tokens": mh.mean(0).numpy().tolist(),
     }
 
-    gate_pre = captured.get((layer, "gate_pre"))
-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
-
-    def safe_per_head(tensor):
-        if tensor is None or not head_dim or tensor.shape[-1] % head_dim != 0:
-            return None
-        return tensor.reshape(batch_size, tensor.shape[1], tensor.shape[-1] // head_dim, head_dim)
-
+    # ⚡ Bolt Optimization:
+    # Previously, act_fn and reshape were applied to the entire batch O(batch_size) times.
+    # We now slice the tensor first, then apply expensive operations to only the needed slice.
     components = cfg.components
-    tensors = {
-        "gate": gate_post,
+    raw_tensors = {
+        "gate": captured.get((layer, "gate_pre")),
         "up": captured.get((layer, "up")),
         "attn": captured.get((layer, "attn_out")),
-        "attn_heads": safe_per_head(captured.get((layer, "attn_pre"))),
-        "q_heads": safe_per_head(captured.get((layer, "q"))),
-        "k_heads": safe_per_head(captured.get((layer, "k"))),
-        "v_heads": safe_per_head(captured.get((layer, "v"))),
+        "attn_heads": captured.get((layer, "attn_pre")),
+        "q_heads": captured.get((layer, "q")),
+        "k_heads": captured.get((layer, "k")),
+        "v_heads": captured.get((layer, "v")),
     }
     key_to_component = {
         "gate": "gate",
@@ -168,10 +162,21 @@ def _row_from_capture(
         "v_heads": "v",
     }
 
-    for prefix, tensor in tensors.items():
-        if tensor is None or key_to_component[prefix] not in components:
+    for prefix, raw_tensor in raw_tensors.items():
+        if raw_tensor is None or key_to_component[prefix] not in components:
             continue
-        t = tensor[batch_index, sl]
+
+        # Slice first
+        t = raw_tensor[batch_index, sl]
+
+        # Apply operations on the sliced tensor
+        if prefix == "gate":
+            t = act_fn(t)
+        elif prefix.endswith("_heads"):
+            if not head_dim or t.shape[-1] % head_dim != 0:
+                continue
+            t = t.reshape(t.shape[0], t.shape[-1] // head_dim, head_dim)
+
         out[f"{prefix}_last"] = t[-1].numpy().tolist()
         out[f"{prefix}_mean"] = t.mean(0).numpy().tolist()
 
