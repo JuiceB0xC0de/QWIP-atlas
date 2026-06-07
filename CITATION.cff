@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use QWIP Atlas in your work, please cite it."
+title: "QWIP Atlas"
+version: 0.1.0
+authors:
+  - name: JuiceB0xC0de
+    alias: chiggy
+    email: chiggy@users.noreply.github.com
+keywords:
+  - mechanistic-interpretability
+  - transformer
+  - atlas
+  - quantization
+  - compliance_behaviour
+  - sae
+license: MIT
+repository-code: "https://github.com/JuiceB0xC0de/QWIP-atlas"
+url: "https://github.com/JuiceB0xC0de/QWIP-atlas"
+preferred-citation:
+  type: software
+  title: "QWIP Atlas"
+  version: 0.1.0
+  authors:
+    - name: JuiceB0xC0de
+      alias: chiggy
+  repository-code: "https://github.com/JuiceB0xC0de/QWIP-atlas"
