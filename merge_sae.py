@@ -19,7 +19,10 @@ but NOT capability-specific → safest to ablate. Each feature's decoder vector
 W_dec[:,feature_idx] in the Qwen-Scope SAE is the steering knob.
 """
 from __future__ import annotations
-import argparse, sqlite3, glob, re
+import argparse
+import sqlite3
+import glob
+import re
 from pathlib import Path
 import numpy as np
 
@@ -75,8 +78,9 @@ def merge(atlas: Path, variant: str, min_act: float) -> int:
     total = 0
     for f in files:
         L = int(re.search(r"sae_l(\d+)_", f).group(1))
-        z = np.load(f, allow_pickle=True)
-        topic = z["topic_fstat"]; act = z["activation_rate"]
+        z = np.load(f, allow_pickle=False)
+        topic = z["topic_fstat"]
+        act = z["activation_rate"]
         has_b = "bouncer_fstat" in z.files
         bouncer = z["bouncer_fstat"] if has_b else np.full_like(topic, np.nan)
         delta   = z["bouncer_delta"] if has_b else np.full_like(topic, np.nan)
@@ -105,7 +109,8 @@ def show_gold(atlas: Path, variant: str, min_bouncer: float, max_topic: float, n
     con = sqlite3.connect(atlas / "atlas.sqlite")
     rows = con.execute(GOLD_SQL, (variant, min_bouncer, max_topic, n)).fetchall()
     if not rows:
-        print("no surgical-gold features matched (need a bouncer pass + tune thresholds)"); return
+        print("no surgical-gold features matched (need a bouncer pass + tune thresholds)")
+        return
     print(f"\n  SURGICAL GOLD — high bouncer_F (>{min_bouncer}) + low topic_F (<{max_topic})")
     print(f"  {'layer':>5} {'feat':>6} {'bouncer_F':>10} {'topic_F':>8} {'delta':>7} {'act':>7}")
     for L, fi, bF, tF, d, a in rows:
