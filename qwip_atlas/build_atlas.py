@@ -649,7 +649,7 @@ def cmd_status(args):
               f"n={m.corpus.get('n_prompts')}  buckets={len(m.corpus.get('buckets', {}))}")
     print(f"[status] layers: {m.layers}")
     print(f"[status] sub_zero layers: {m.subzero_layers}")
-    print(f"[status] components_per_layer:")
+    print("[status] components_per_layer:")
     for layer, comps in sorted(m.components_per_layer.items()):
         print(f"           layer {layer}: {comps}")
 
