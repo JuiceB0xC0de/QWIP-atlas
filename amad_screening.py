@@ -14,7 +14,6 @@ Output: layer_groups.json + screening report printed to stdout.
 import json
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
 
 ATLAS_DIR  = Path("atlas/layers")
 COMPONENTS = ["gate", "up", "mlp"]
@@ -152,7 +151,7 @@ def main():
         ls = ",".join(f"L{l}" for l in g["layers"])
         print(f"{i:<4} {ls:<38} {g['tier']:<8} {g['peak_fstat']:>7.2f} {g['sae_runs']:>5}")
 
-    print(f"\nAdjacent-layer distances (combined, degrees):")
+    print("\nAdjacent-layer distances (combined, degrees):")
     for i in range(n_layers - 1):
         d = combined[i, i+1]
         if np.isnan(d):
@@ -161,7 +160,7 @@ def main():
         attn_type = "GLOBAL" if i+1 in {4,9,14,19,24,29,34} else "local "
         print(f"  L{i:02d}↔L{i+1:02d}  [{attn_type}]  {d:5.1f}°{flag}")
 
-    print(f"\nF-stat peaks by layer:")
+    print("\nF-stat peaks by layer:")
     for l in range(n_layers):
         p    = peaks[l]
         tier = "HIGH  " if p >= TIER_HIGH else ("MED   " if p >= TIER_MEDIUM else "skip  ")

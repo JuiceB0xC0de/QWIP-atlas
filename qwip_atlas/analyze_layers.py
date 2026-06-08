@@ -201,7 +201,6 @@ def plot_census_heatmap(A: np.ndarray, buckets: list[str],
                         top_k: int = 500,
                         layer: int = 0):
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     import seaborn as sns
     from scipy.cluster.hierarchy import linkage, leaves_list
     from scipy.spatial.distance import pdist
@@ -343,7 +342,6 @@ def compute_separation_scores(A: np.ndarray, buckets: list[str]) -> np.ndarray:
 
     overall_mean = A.mean(axis=1, keepdims=True)            # [n_features, 1]
     between_var  = np.zeros(n_features, dtype=np.float64)
-    within_var   = np.zeros(n_features, dtype=np.float64)
 
     for b in unique:
         mask = bucket_arr == b
@@ -353,7 +351,10 @@ def compute_separation_scores(A: np.ndarray, buckets: list[str]) -> np.ndarray:
         x_b = A[:, mask]                                     # [n_features, n_b]
         mu_b = x_b.mean(axis=1, keepdims=True)               # [n_features, 1]
         between_var += n_b * (mu_b - overall_mean).squeeze(-1) ** 2
-        within_var  += ((x_b - mu_b) ** 2).sum(axis=1)
+
+    # Vectorize within_var calculation using SST = SSB + SSW => SSW = SST - SSB
+    sst = A.var(axis=1) * n_prompts
+    within_var = np.maximum(0, sst - between_var)
 
     df_between = max(len(unique) - 1, 1)
     df_within  = max(n_prompts - len(unique), 1)
@@ -549,8 +550,8 @@ def analyze_per_head(name: str, A_3d: np.ndarray, buckets: list[str],
 
     write_json(out / f"l{layer}_{name}_per_head.json", per_head_summaries)
 
-    print(f"\n  head | specific | F_best   | F_mean    | code_top_spec | most_code_dim")
-    print(f"  -----|----------|----------|-----------|---------------|---------------")
+    print("\n  head | specific | F_best   | F_mean    | code_top_spec | most_code_dim")
+    print("  -----|----------|----------|-----------|---------------|---------------")
     for s in per_head_summaries:
         n_spec = s["taxonomy"].get("specific", 0)
         code_spec_str = f"{s['top_code_spec']:>13.4f}" if not np.isnan(s["top_code_spec"]) else f"{'n/a':>13}"
@@ -736,7 +737,7 @@ def main():
         if code_bucket:
             print(f"\nCode bucket auto-detected: '{code_bucket}'  ({bucket_counts[code_bucket]} prompts)")
         else:
-            print(f"\n[warn] No code-like bucket found. Pass --code-bucket <name> to set explicitly.")
+            print("\n[warn] No code-like bucket found. Pass --code-bucket <name> to set explicitly.")
 
     # Filter components if user specified
     if args.components:
