@@ -138,10 +138,22 @@ def classify_neurons(A: np.ndarray, buckets: list[str]) -> list[dict]:
     unique_buckets = sorted(set(buckets))
     bucket_arr = np.array(buckets)
 
+    # ⚡ Bolt: Vectorize bucket masks and means outside the loop to avoid O(d_mlp * n_buckets) array operations
+    valid_buckets = []
+    bucket_means = {}
+    for bkt in unique_buckets:
+        mask = bucket_arr == bkt
+        if mask.sum() > 0:
+            valid_buckets.append(bkt)
+            bucket_means[bkt] = active_mask[:, mask].mean(axis=1)
+
+    # ⚡ Bolt: Precompute overall means and stds outside the loop to avoid O(d_mlp) numpy slice aggregations
+    overall_means = A.mean(axis=1)
+    overall_stds = A.std(axis=1)
+
     classifications = []
     for i in range(d_mlp):
         rate = float(activation_rates[i])
-        neuron_active = active_mask[i]  # [n_prompts]
 
         if rate < 0.05:
             cls = "non_activated"
@@ -150,18 +162,17 @@ def classify_neurons(A: np.ndarray, buckets: list[str]) -> list[dict]:
         elif rate > 0.50:
             cls = "broadly_shared"
         else:
-            # compute per-bucket activation rate
-            bucket_rates = {}
-            for bkt in unique_buckets:
-                mask = bucket_arr == bkt
-                if mask.sum() > 0:
-                    bucket_rates[bkt] = float(neuron_active[mask].mean())
-
-            if not bucket_rates:
+            if not valid_buckets:
                 cls = "partial_shared"
             else:
-                best_bkt = max(bucket_rates, key=bucket_rates.get)
-                best_rate = bucket_rates[best_bkt]
+                # compute per-bucket activation rate from precomputed means
+                best_bkt = None
+                best_rate = -1.0
+                for bkt in valid_buckets:
+                    b_rate = float(bucket_means[bkt][i])
+                    if b_rate > best_rate:
+                        best_rate = b_rate
+                        best_bkt = bkt
 
                 if best_rate > 0.80 and rate < 0.30:
                     cls = f"specific_{best_bkt}"
@@ -172,8 +183,8 @@ def classify_neurons(A: np.ndarray, buckets: list[str]) -> list[dict]:
             "neuron_idx":      i,
             "class":           cls,
             "activation_rate": rate,
-            "mean_activation": float(A[i].mean()),
-            "std_activation":  float(A[i].std()),
+            "mean_activation": float(overall_means[i]),
+            "std_activation":  float(overall_stds[i]),
         })
 
     return classifications
