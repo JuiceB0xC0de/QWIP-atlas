@@ -96,38 +96,38 @@ def main():
     combined = np.nanmean(np.stack(list(dist_per_comp.values())), axis=0)
 
     # ── 3. F-stat peaks per layer ────────────────────────────────────────────
-    peaks = {l: fstat_peak(l) for l in range(n_layers)}
+    peaks = {lyr: fstat_peak(lyr) for lyr in range(n_layers)}
 
     # ── 4. Greedy contiguous grouping ────────────────────────────────────────
     def greedy_group(layers, threshold):
         groups, current = [], [layers[0]]
-        for l in layers[1:]:
+        for lyr in layers[1:]:
             max_dist = max(
-                combined[l][j] if not np.isnan(combined[l][j]) else 999
+                combined[lyr][j] if not np.isnan(combined[lyr][j]) else 999
                 for j in current
             )
             if max_dist < threshold:
-                current.append(l)
+                current.append(lyr)
             else:
                 groups.append(current)
-                current = [l]
+                current = [lyr]
         groups.append(current)
         return groups
 
-    present = [l for l in range(n_layers) if any((l, c) in vecs for c in COMPONENTS)]
+    present = [lyr for lyr in range(n_layers) if any((lyr, c) in vecs for c in COMPONENTS)]
     raw_groups = greedy_group(present, GROUP_THRESHOLD_DEG)
 
     # ── 5. Assign tiers — split high-signal groups into per-layer runs ───────
     layer_groups = []
     total_runs   = 0
     for g in raw_groups:
-        group_peak = max(peaks[l] for l in g)
+        group_peak = max(peaks[lyr] for lyr in g)
         if group_peak >= TIER_HIGH:
-            for l in g:
-                lp   = peaks[l]
+            for lyr in g:
+                lp   = peaks[lyr]
                 tier = "high" if lp >= TIER_HIGH else ("medium" if lp >= TIER_MEDIUM else "skip")
                 runs = 0 if tier == "skip" else 1
-                layer_groups.append({"layers": [l], "tier": tier,
+                layer_groups.append({"layers": [lyr], "tier": tier,
                                      "peak_fstat": round(lp, 2), "sae_runs": runs})
                 total_runs += runs
         elif group_peak >= TIER_MEDIUM:
@@ -148,7 +148,7 @@ def main():
     print(f"{'#':<4} {'Layers':<38} {'Tier':<8} {'F-peak':>7} {'Runs':>5}")
     print("-" * 65)
     for i, g in enumerate(layer_groups):
-        ls = ",".join(f"L{l}" for l in g["layers"])
+        ls = ",".join(f"L{lyr}" for lyr in g["layers"])
         print(f"{i:<4} {ls:<38} {g['tier']:<8} {g['peak_fstat']:>7.2f} {g['sae_runs']:>5}")
 
     print("\nAdjacent-layer distances (combined, degrees):")
@@ -161,12 +161,12 @@ def main():
         print(f"  L{i:02d}↔L{i+1:02d}  [{attn_type}]  {d:5.1f}°{flag}")
 
     print("\nF-stat peaks by layer:")
-    for l in range(n_layers):
-        p    = peaks[l]
+    for lyr in range(n_layers):
+        p    = peaks[lyr]
         tier = "HIGH  " if p >= TIER_HIGH else ("MED   " if p >= TIER_MEDIUM else "skip  ")
         bar  = "█" * min(40, int(p / 1.5))
-        attn = "G" if l in {4,9,14,19,24,29,34} else "."
-        print(f"  L{l:02d} [{attn}] {tier} F={p:7.2f}  {bar}")
+        attn = "G" if lyr in {4,9,14,19,24,29,34} else "."
+        print(f"  L{lyr:02d} [{attn}] {tier} F={p:7.2f}  {bar}")
 
     # ── 7. Save ───────────────────────────────────────────────────────────────
     out = {
@@ -174,7 +174,7 @@ def main():
         "components": COMPONENTS,
         "groups": layer_groups,
         "total_sae_runs": total_runs,
-        "fstat_peaks": {str(l): round(v, 4) for l, v in peaks.items()},
+        "fstat_peaks": {str(lyr): round(v, 4) for lyr, v in peaks.items()},
         "amad_combined": [
             [None if np.isnan(combined[i,j]) else round(float(combined[i,j]), 2)
              for j in range(n_layers)]
