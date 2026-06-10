@@ -306,6 +306,9 @@ def compute_coactivation(A: np.ndarray, buckets: list[str],
     unique_buckets = sorted(set(buckets))
     active_mask = A_top > ACTIVATION_THRESHOLD
 
+    # ⚡ Bolt Optimization: Vectorize bucket masks outside the loop to prevent O(N_pairs * N_buckets) array reallocations
+    b_masks = np.array([bucket_arr == bkt for bkt in unique_buckets])
+
     pairs = []
     rows, cols = np.where(np.abs(corr) > corr_threshold)
     for r, c in zip(rows, cols):
@@ -313,14 +316,13 @@ def compute_coactivation(A: np.ndarray, buckets: list[str],
             continue
         # Find the bucket where both neurons co-activate most
         joint_active = active_mask[r] & active_mask[c]
-        dominant_bkt = None
-        best_joint = 0
-        for bkt in unique_buckets:
-            mask = bucket_arr == bkt
-            joint_in_bkt = (joint_active & mask).sum()
-            if joint_in_bkt > best_joint:
-                best_joint = joint_in_bkt
-                dominant_bkt = bkt
+
+        # ⚡ Bolt Optimization: Replace loop over buckets with a single vectorized dot-product-like reduction
+        joint_in_buckets = (joint_active & b_masks).sum(axis=1)
+        best_idx = np.argmax(joint_in_buckets)
+        best_joint = int(joint_in_buckets[best_idx])
+
+        dominant_bkt = unique_buckets[best_idx] if best_joint > 0 else None
 
         pairs.append({
             "neuron_a":       int(top_idx[r]),
@@ -459,7 +461,7 @@ def analyze_code_neurons(A: np.ndarray, buckets: list[str],
     code_mask  = (bucket_arr == code_bucket)
     other_mask = ~code_mask
 
-    d_mlp = A.shape[0]
+#    d_mlp = A.shape[0]
     active_mask = A > ACTIVATION_THRESHOLD
 
     # For each neuron: activation rate on code vs non-code
