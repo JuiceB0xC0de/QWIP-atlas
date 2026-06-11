@@ -459,7 +459,7 @@ def analyze_code_neurons(A: np.ndarray, buckets: list[str],
     code_mask  = (bucket_arr == code_bucket)
     other_mask = ~code_mask
 
-    d_mlp = A.shape[0]
+
     active_mask = A > ACTIVATION_THRESHOLD
 
     # For each neuron: activation rate on code vs non-code

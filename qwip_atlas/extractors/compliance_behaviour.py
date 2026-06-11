@@ -31,10 +31,10 @@ def _load_prompts(corpus, label: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _safe_per_head(tensor, head_dim: int | None):
+def _check_per_head(tensor, head_dim: int | None):
     if tensor is None or not head_dim or tensor.shape[-1] % head_dim != 0:
         return None
-    return tensor.reshape(tensor.shape[0], tensor.shape[1], tensor.shape[-1] // head_dim, head_dim)
+    return tensor
 
 
 def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, batch_idx: int, seq_len: int):
@@ -48,24 +48,34 @@ def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, inf
     if mlp_hidden is None:
         return {}
 
-    gate_pre = captured.get((layer, "gate_pre"))
-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
-    tensors = {
+    # ⚡ Bolt Optimization:
+    # Previously, act_fn was applied to the entire batch and sequence length,
+    # and _safe_per_head triggered expensive reshapes across the full batch.
+    # We now slice the raw tensor first, avoiding O(batch_size * seq_len * d_model)
+    # unnecessary computation, then apply operations specifically on the needed slice.
+    raw_tensors = {
         "mlp": mlp_hidden,
-        "gate": gate_post,
+        "gate": captured.get((layer, "gate_pre")),
         "up": captured.get((layer, "up")),
         "attn": captured.get((layer, "attn_out")),
-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
+        "heads": _check_per_head(captured.get((layer, "attn_pre")), head_dim),
+        "q": _check_per_head(captured.get((layer, "q")), head_dim),
+        "k": _check_per_head(captured.get((layer, "k")), head_dim),
+        "v": _check_per_head(captured.get((layer, "v")), head_dim),
     }
 
     out = {}
-    for name, tensor in tensors.items():
+    for name, tensor in raw_tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).numpy()
+
+        # Slice the tensor to get the last token first
+        t = tensor[batch_idx, sl][-1]
+
+        if name == "gate":
+            t = act_fn(t)
+
+        out[name] = t.reshape(-1).numpy()
     return out
 
 
