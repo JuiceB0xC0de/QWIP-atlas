@@ -212,6 +212,8 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
     whole batch to CPU once, vectorizes per-layer slicing, and writes layer
     streams in parallel threads.
     """
+    import time
+
     import torch
     from tqdm import tqdm
 
@@ -297,13 +299,16 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
             device = getattr(model, "device", None) or next(model.parameters()).device
             enc = {k: v.to(device) for k, v in enc.items()}
 
+            t0 = time.time()
             captured: dict[tuple[int, str], Any] = {}
             handles = _register_hooks(per_layer_info, captured)
             with torch.no_grad():
                 model(**enc, use_cache=False)
             for handle in handles:
                 handle.remove()
+            t_forward = time.time() - t0
 
+            t0 = time.time()
             # Build all layer rows in parallel (CPU-bound numpy/tensor slicing).
             def _build_for_layer(layer):
                 return layer, _build_layer_rows(
@@ -316,17 +321,26 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
                 )
 
             layer_rows = dict(pool.map(_build_for_layer, per_layer_info.keys()))
+            t_build = time.time() - t0
 
+            t0 = time.time()
             # Write sequentially so the JSON streams stay consistent.
             for layer in per_layer_info:
                 writer = writers[layer]
                 for out in layer_rows[layer]:
                     writer.write(out)
                 counts[layer] += len(layer_rows[layer])
+            t_write = time.time() - t0
 
             captured.clear()
             if torch.cuda.is_available():
                 torch.cuda.current_stream().synchronize()
+
+            if start == 0 or (start // cfg.batch_size) % 5 == 0:
+                print(
+                    f"[timings] batch {start//cfg.batch_size}: "
+                    f"forward={t_forward:.3f}s build={t_build:.3f}s write={t_write:.3f}s"
+                )
 
     print(f"[extract] wrote: {counts}")
     return counts
