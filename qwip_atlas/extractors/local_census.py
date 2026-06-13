@@ -410,5 +410,13 @@ class streams_context:
         return self.opened
 
     def __exit__(self, exc_type, exc, tb):
-        for stream in self.streams.values():
+        # Finalize each layer's .npz in parallel. Each finalize loads temp files,
+        # concatenates, compresses, and writes — this is CPU/disk heavy and layers
+        # are independent, so parallelizing gives a large wall-clock win.
+        import concurrent.futures
+
+        def _close_one(stream):
             stream.__exit__(exc_type, exc, tb)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(self.streams), 8)) as pool:
+            pool.map(_close_one, self.streams.values())
