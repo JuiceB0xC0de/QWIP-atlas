@@ -14,7 +14,7 @@ def read_json(path: str | Path) -> Any:
 def read_census(path: str | Path) -> list[dict[str, Any]]:
     """Read a census file, transparently handling .json or .npz formats.
 
-    The .npz format stores activation arrays in binary plus a small JSONL
+    The .npz format stores activation arrays in binary plus a small JSON
     metadata block, which is much smaller and faster than a huge JSON array.
     """
     p = Path(path)
@@ -97,14 +97,12 @@ def write_json_array_stream(path: str | Path):
 
 
 def write_npz_array_stream(path: str | Path):
-    """Context manager that accumulates records and writes a .npz census file.
+    """Context manager that accumulates per-batch arrays and writes a .npz file.
 
-    Records are split into:
-      - _metadata: JSON of per-row metadata (id, bucket, category, prompt, etc.)
-      - one numpy array per activation field, shaped [N, ...]
-
-    Activations are stored as float16 to cut file size and write bandwidth in
-    half; the read path upcasts to float32 so downstream analysis is unchanged.
+    Each call to write() accepts a list of metadata dicts and a dict of numpy
+    arrays for one batch. Arrays are concatenated along axis 0 at close time.
+    Activations are stored as float16 to cut file size and write bandwidth;
+    the read path upcasts back to float32.
     """
     import numpy as np
     import orjson
@@ -113,35 +111,34 @@ def write_npz_array_stream(path: str | Path):
         def __init__(self, out: Path):
             self.out = out
             self.metadata: list[dict[str, Any]] = []
-            self.fields: dict[str, list[Any]] = {}
+            self.arrays: dict[str, list[Any]] = {}
 
         def __enter__(self):
             self.out.parent.mkdir(parents=True, exist_ok=True)
             return self
 
-        def write(self, obj: dict[str, Any]) -> None:
-            # Activation fields are any list-valued keys. Seed from the first record.
-            if not self.fields:
-                for k, v in obj.items():
-                    if isinstance(v, (list, tuple)):
-                        self.fields[k] = []
-            # Metadata is the small non-array fields.
-            meta = {k: v for k, v in obj.items() if k not in self.fields}
-            for k in self.fields:
-                self.fields[k].append(obj[k])
-            self.metadata.append(meta)
+        def write(
+            self,
+            metadata: list[dict[str, Any]],
+            arrays: dict[str, Any],
+        ) -> None:
+            self.metadata.extend(metadata)
+            for k, arr in arrays.items():
+                self.arrays.setdefault(k, []).append(arr)
 
         def __exit__(self, exc_type, exc, tb):
             if exc_type is not None:
                 return
-            arrays: dict[str, np.ndarray] = {}
-            for k, rows in self.fields.items():
-                # float16 keeps full bf16/fp32 dynamic range with plenty precision
-                # for activation census work; halves storage + write bandwidth.
-                arrays[k] = np.asarray(rows, dtype=np.float16)
+            final_arrays: dict[str, Any] = {}
+            for k, parts in self.arrays.items():
+                stacked = np.concatenate(parts, axis=0)
+                # float16 keeps full dynamic range for activations; halves size.
+                if stacked.dtype == np.float32:
+                    stacked = stacked.astype(np.float16)
+                final_arrays[k] = stacked
             metadata_json = orjson.dumps(self.metadata, default=str)
-            arrays["_metadata"] = np.frombuffer(metadata_json, dtype=np.uint8)
-            np.savez_compressed(self.out, **arrays)
+            final_arrays["_metadata"] = np.frombuffer(metadata_json, dtype=np.uint8)
+            np.savez_compressed(self.out, **final_arrays)
 
     return _Stream(Path(path))
 

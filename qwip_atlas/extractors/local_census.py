@@ -63,13 +63,18 @@ def _load_model_and_tokenizer(cfg: AtlasRunConfig, hf_token: str | None):
     return model, tokenizer
 
 
-def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, str], Any]):
+def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, str], Any], components: set[str]):
+    """Register hooks only for the components the user asked for.
+
+    This avoids materializing large activation tensors that will be thrown away.
+    mlp_hidden is always captured because it drives the base metadata field
+    max_token_idx and the legacy 'mlp' component.
+    """
     handles = []
 
     def make_hook(layer: int, key: str, take_input: bool = False):
         if take_input:
             def _hook(module, inputs):
-                # Keep on GPU; bulk transfer after forward pass.
                 captured[(layer, key)] = inputs[0].detach()
             return _hook
 
@@ -80,137 +85,188 @@ def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, s
 
     for layer, info in per_layer_info.items():
         mlp, attn = info["mlp"], info["attn"]
+        # Always need mlp_hidden for metadata max_token_idx.
         if mlp["down_proj"] is not None:
             handles.append(mlp["down_proj"].register_forward_pre_hook(
                 make_hook(layer, "mlp_hidden", take_input=True)
             ))
-        if mlp["gate_proj"] is not None:
+        if "gate" in components and mlp["gate_proj"] is not None:
             handles.append(mlp["gate_proj"].register_forward_hook(make_hook(layer, "gate_pre")))
-        if mlp["up_proj"] is not None:
+        if "up" in components and mlp["up_proj"] is not None:
             handles.append(mlp["up_proj"].register_forward_hook(make_hook(layer, "up")))
-        if attn["q_proj"] is not None:
+        if "q" in components and attn["q_proj"] is not None:
             handles.append(attn["q_proj"].register_forward_hook(make_hook(layer, "q")))
-        if attn["k_proj"] is not None:
+        if "k" in components and attn["k_proj"] is not None:
             handles.append(attn["k_proj"].register_forward_hook(make_hook(layer, "k")))
-        if attn["v_proj"] is not None:
+        if "v" in components and attn["v_proj"] is not None:
             handles.append(attn["v_proj"].register_forward_hook(make_hook(layer, "v")))
-        if attn["o_proj"] is not None:
+        if "heads" in components and attn["o_proj"] is not None:
             handles.append(attn["o_proj"].register_forward_pre_hook(
                 make_hook(layer, "attn_pre", take_input=True)
             ))
-        if attn["module"] is not None:
+        if "attn" in components and attn["module"] is not None:
             handles.append(attn["module"].register_forward_hook(make_hook(layer, "attn_out")))
 
     return handles
 
 
-def _build_layer_rows(
+def _slice_and_mean(tensor: Any, seq_lens: list[int]) -> tuple[Any, Any]:
+    """Vectorized last-token and variable-length mean over a batch.
+
+    Input tensor has shape [B, max_seq_len, ...] after slicing to the longest
+    real sequence. Padding is left-aligned, so real tokens are at the end.
+    Returns (last_token, mean_tokens) both shaped [B, ...].
+    """
+    import numpy as np
+
+    B = len(seq_lens)
+    max_seq_len = tensor.shape[1]
+    last = tensor[:, -1, ...]
+
+    # Build a per-example length mask.
+    mask = np.zeros((B, max_seq_len), dtype=bool)
+    for i, length in enumerate(seq_lens):
+        mask[i, -length:] = True
+
+    # Expand mask to broadcast against arbitrary trailing dims.
+    expand_axes = tuple(range(2, tensor.ndim))
+    if expand_axes:
+        mask = np.expand_dims(mask, axis=expand_axes)
+    masked = tensor * mask
+    summed = masked.sum(axis=1)
+    mean = summed / np.array(seq_lens).reshape((B,) + (1,) * (tensor.ndim - 2))
+    return last, mean
+
+
+def _build_layer_arrays(
     layer: int,
     info: dict,
     captured: dict[tuple[int, str], Any],
     rows: list[dict[str, Any]],
     seq_lens: list[int],
     cfg: AtlasRunConfig,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build one batch of census arrays for a single layer.
+
+    Returns (metadata_list, arrays_dict). Arrays are numpy arrays with no
+    .tolist() conversion; the writer concatenates them directly into .npz.
+    """
     import numpy as np
     import torch
 
     mlp_hidden = captured.get((layer, "mlp_hidden"))
     if mlp_hidden is None:
-        return []
+        return [], {}
 
     act_fn = info["mlp"].get("act_fn") or torch.nn.functional.silu
     head_dim = info["attn"]["head_dim"]
-    batch_size = len(rows)
+    components = cfg.components
 
-    # Slice away padding on GPU before transfer. The longest real sequence in
-    # the batch is the most we ever need; anything beyond that is padding tokens.
-    max_seq_len = max(seq_lens)
-    sl_transfer = slice(-max_seq_len, None)
-    mlp_hidden = mlp_hidden[:, sl_transfer]
-
-    # Bring the whole batch to CPU once, as float32.
-    # We do non-blocking copies via .to('cpu', non_blocking=True), then synchronize.
     use_cuda = mlp_hidden.device.type == "cuda"
-    raw_tensors = {
-        "gate": captured.get((layer, "gate_pre")),
-        "up": captured.get((layer, "up")),
-        "attn": captured.get((layer, "attn_out")),
-        "attn_heads": captured.get((layer, "attn_pre")),
-        "q_heads": captured.get((layer, "q")),
-        "k_heads": captured.get((layer, "k")),
-        "v_heads": captured.get((layer, "v")),
-    }
+    max_seq_len = max(seq_lens)
+    sl = slice(-max_seq_len, None)
 
-    mh_cpu = mlp_hidden.float().to("cpu", non_blocking=use_cuda)
-    cpu_tensors = {"mlp_hidden": mh_cpu}
-    for key, t in raw_tensors.items():
-        if t is None:
-            continue
-        cpu_tensors[key] = t[:, sl_transfer].float().to("cpu", non_blocking=use_cuda)
+    # Slice away padding on GPU before any transfer.
+    mlp_hidden = mlp_hidden[:, sl]
+
+    # Apply silu to gate on GPU before transfer, then collect all needed tensors.
+    gpu_tensors: dict[str, Any] = {"mlp_hidden": mlp_hidden}
+    if "gate" in components and (layer, "gate_pre") in captured:
+        gpu_tensors["gate"] = act_fn(captured[(layer, "gate_pre")][:, sl])
+    for key, comp_key in [
+        ("up", "up"),
+        ("attn", "attn_out"),
+        ("attn_heads", "attn_pre"),
+        ("q_heads", "q"),
+        ("k_heads", "k"),
+        ("v_heads", "v"),
+    ]:
+        if key_to_component_name(comp_key) in components and (layer, comp_key) in captured:
+            gpu_tensors[key] = captured[(layer, comp_key)][:, sl]
+
+    # Transfer everything to CPU in one non-blocking wave, then synchronize once.
+    cpu_tensors = {
+        k: v.float().to("cpu", non_blocking=use_cuda)
+        for k, v in gpu_tensors.items()
+    }
     if use_cuda:
         torch.cuda.current_stream().synchronize()
 
-    mh = mh_cpu.numpy()
-    np_tensors = {k: v.numpy() for k, v in cpu_tensors.items() if k != "mlp_hidden"}
+    np_tensors = {k: v.numpy() for k, v in cpu_tensors.items()}
+    mlp_np = np_tensors.pop("mlp_hidden")
 
-    # Apply the MLP activation function once to the whole batch slice.
-    if "gate" in np_tensors:
-        np_tensors["gate"] = act_fn(torch.from_numpy(np_tensors["gate"])).numpy()
+    arrays: dict[str, Any] = {}
 
-    components = cfg.components
-    key_to_component = {
-        "gate": "gate",
-        "up": "up",
-        "attn": "attn",
-        "attn_heads": "heads",
-        "q_heads": "q",
-        "k_heads": "k",
-        "v_heads": "v",
-    }
+    # MLP component.
+    if "mlp" in components:
+        arrays["last_token"], arrays["mean_tokens"] = _slice_and_mean(mlp_np, seq_lens)
 
-    out_rows = []
-    for batch_index, (row, seq_len) in enumerate(zip(rows, seq_lens)):
-        sl = slice(-int(seq_len), None)
-        mh_slice = mh[batch_index, sl]
+    # Non-per-head components.
+    for key, out_prefix in [("gate", "gate"), ("up", "up"), ("attn", "attn")]:
+        if key in np_tensors:
+            last, mean = _slice_and_mean(np_tensors[key], seq_lens)
+            arrays[f"{out_prefix}_last"] = last
+            arrays[f"{out_prefix}_mean"] = mean
 
-        out = {
-            "id": row.get("id", f"p{row.get('_record_idx', batch_index):06d}"),
+    # Per-head components: reshape [B, seq, H*Dh] -> [B, seq, H, Dh].
+    for key, out_prefix in [
+        ("attn_heads", "attn_heads"),
+        ("q_heads", "q_heads"),
+        ("k_heads", "k_heads"),
+        ("v_heads", "v_heads"),
+    ]:
+        if key not in np_tensors:
+            continue
+        t = np_tensors[key]
+        if head_dim and t.shape[-1] % head_dim == 0:
+            t = t.reshape(*t.shape[:-1], t.shape[-1] // head_dim, head_dim)
+            # Move head axis to be adjacent to batch for easier downstream reading.
+            # Current: [B, seq, H, Dh]. Downstream expects records as [H, Dh].
+            last, mean = _slice_and_mean(t, seq_lens)
+            arrays[f"{out_prefix}_last"] = last
+            arrays[f"{out_prefix}_mean"] = mean
+
+    # Metadata for the batch.
+    metadata = []
+    abs_sum = np.abs(mlp_np).sum(axis=-1)
+    for i, row in enumerate(rows):
+        sl_i = slice(-int(seq_lens[i]), None)
+        metadata.append({
+            "id": row.get("id", f"p{row.get('_record_idx', i):06d}"),
             "bucket": row.get("_bucket", "uncategorized"),
             "category": row.get(cfg.corpus.category_key, ""),
             "subcategory": row.get("subcategory", ""),
             "prompt": row[cfg.corpus.prompt_key],
             "is_contrast": row.get("is_contrast", False),
             "contrast_pair_id": row.get("contrast_pair_id"),
-            "seq_len": int(seq_len),
-            "max_token_idx": int(np.abs(mh_slice).sum(axis=-1).argmax().item()),
-            "last_token": mh_slice[-1].tolist(),
-            "mean_tokens": mh_slice.mean(0).tolist(),
-        }
+            "seq_len": int(seq_lens[i]),
+            "max_token_idx": int(abs_sum[i, sl_i].argmax()),
+        })
 
-        for prefix, np_tensor in np_tensors.items():
-            if key_to_component[prefix] not in components:
-                continue
-            t = np_tensor[batch_index, sl]
-            if prefix.endswith("_heads"):
-                if not head_dim or t.shape[-1] % head_dim != 0:
-                    continue
-                t = t.reshape(t.shape[0], t.shape[-1] // head_dim, head_dim)
+    return metadata, arrays
 
-            out[f"{prefix}_last"] = t[-1].tolist()
-            out[f"{prefix}_mean"] = t.mean(0).tolist()
 
-        out_rows.append(out)
-
-    return out_rows
+def key_to_component_name(key: str) -> str:
+    return {
+        "gate_pre": "gate",
+        "up": "up",
+        "attn_out": "attn",
+        "attn_pre": "heads",
+        "q": "q",
+        "k": "k",
+        "v": "v",
+    }.get(key, key)
 
 
 def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[int, int]:
-    """Capture multi-layer activations into `l<N>_census_raw.json` files.
+    """Capture multi-layer activations into `l<N>_census_raw.npz` files.
 
-    GPU-optimized: keeps tensors on GPU during the forward pass, transfers the
-    whole batch to CPU once, vectorizes per-layer slicing, and writes layer
-    streams in parallel threads.
+    GPU-optimized:
+      - Hooks only for components the user wants.
+      - Tensors stay on GPU during forward, slice to max real seq len, then
+        transfer to CPU in one non-blocking wave per batch.
+      - Last-token and variable-length mean are computed vectorized in numpy.
+      - No per-row .tolist(); arrays are concatenated directly into .npz.
     """
     import time
 
@@ -280,8 +336,8 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
         for i, row in enumerate(corpus)
     ]
 
-    # One executor for the whole run. We parallelize the CPU-heavy row slicing
-    # across layers; JSON writes stay in the main thread to avoid stream corruption.
+    # One executor for the whole run. We parallelize the CPU-heavy array slicing
+    # across layers; writes stay in the main thread to keep file streams safe.
     max_workers = min(len(per_layer_info), 8)
 
     with streams_context(streams) as writers, concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -301,7 +357,7 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
 
             t0 = time.time()
             captured: dict[tuple[int, str], Any] = {}
-            handles = _register_hooks(per_layer_info, captured)
+            handles = _register_hooks(per_layer_info, captured, cfg.components)
             with torch.no_grad():
                 model(**enc, use_cache=False)
             for handle in handles:
@@ -309,9 +365,9 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
             t_forward = time.time() - t0
 
             t0 = time.time()
-            # Build all layer rows in parallel (CPU-bound numpy/tensor slicing).
+
             def _build_for_layer(layer):
-                return layer, _build_layer_rows(
+                return layer, _build_layer_arrays(
                     layer=layer,
                     info=per_layer_info[layer],
                     captured=captured,
@@ -320,16 +376,14 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
                     cfg=cfg,
                 )
 
-            layer_rows = dict(pool.map(_build_for_layer, per_layer_info.keys()))
+            layer_batches = dict(pool.map(_build_for_layer, per_layer_info.keys()))
             t_build = time.time() - t0
 
             t0 = time.time()
-            # Write sequentially so the JSON streams stay consistent.
             for layer in per_layer_info:
-                writer = writers[layer]
-                for out in layer_rows[layer]:
-                    writer.write(out)
-                counts[layer] += len(layer_rows[layer])
+                metadata, arrays = layer_batches[layer]
+                writers[layer].write(metadata, arrays)
+                counts[layer] += len(metadata)
             t_write = time.time() - t0
 
             captured.clear()
