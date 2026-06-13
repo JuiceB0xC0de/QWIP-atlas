@@ -123,6 +123,12 @@ def _build_layer_rows(
     head_dim = info["attn"]["head_dim"]
     batch_size = len(rows)
 
+    # Slice away padding on GPU before transfer. The longest real sequence in
+    # the batch is the most we ever need; anything beyond that is padding tokens.
+    max_seq_len = max(seq_lens)
+    sl_transfer = slice(-max_seq_len, None)
+    mlp_hidden = mlp_hidden[:, sl_transfer]
+
     # Bring the whole batch to CPU once, as float32.
     # We do non-blocking copies via .to('cpu', non_blocking=True), then synchronize.
     use_cuda = mlp_hidden.device.type == "cuda"
@@ -141,7 +147,7 @@ def _build_layer_rows(
     for key, t in raw_tensors.items():
         if t is None:
             continue
-        cpu_tensors[key] = t.float().to("cpu", non_blocking=use_cuda)
+        cpu_tensors[key] = t[:, sl_transfer].float().to("cpu", non_blocking=use_cuda)
     if use_cuda:
         torch.cuda.current_stream().synchronize()
 

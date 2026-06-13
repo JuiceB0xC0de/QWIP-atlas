@@ -38,14 +38,10 @@ def _read_npz_census(path: Path) -> list[dict[str, Any]]:
             if key == "_metadata":
                 continue
             arr = z[key]
-            if arr.ndim == 1:
-                rec[key] = arr[i].tolist()
-            elif arr.ndim == 2:
-                rec[key] = arr[i].tolist()
-            elif arr.ndim == 3:
-                rec[key] = arr[i].tolist()
-            elif arr.ndim == 4:
-                rec[key] = arr[i].tolist()
+            # Upcast float16 census arrays back to float32 for downstream code.
+            if arr.dtype == np.float16:
+                arr = arr.astype(np.float32)
+            rec[key] = arr[i].tolist()
         records.append(rec)
     return records
 
@@ -104,11 +100,11 @@ def write_npz_array_stream(path: str | Path):
     """Context manager that accumulates records and writes a .npz census file.
 
     Records are split into:
-      - _metadata: JSONL of per-row metadata (id, bucket, category, prompt, etc.)
+      - _metadata: JSON of per-row metadata (id, bucket, category, prompt, etc.)
       - one numpy array per activation field, shaped [N, ...]
 
-    This avoids the enormous per-row JSON serialization cost of large census
-    files and is typically 5-10x faster to write and read.
+    Activations are stored as float16 to cut file size and write bandwidth in
+    half; the read path upcasts to float32 so downstream analysis is unchanged.
     """
     import numpy as np
     import orjson
@@ -140,7 +136,9 @@ def write_npz_array_stream(path: str | Path):
                 return
             arrays: dict[str, np.ndarray] = {}
             for k, rows in self.fields.items():
-                arrays[k] = np.asarray(rows, dtype=np.float32)
+                # float16 keeps full bf16/fp32 dynamic range with plenty precision
+                # for activation census work; halves storage + write bandwidth.
+                arrays[k] = np.asarray(rows, dtype=np.float16)
             metadata_json = orjson.dumps(self.metadata, default=str)
             arrays["_metadata"] = np.frombuffer(metadata_json, dtype=np.uint8)
             np.savez_compressed(self.out, **arrays)
