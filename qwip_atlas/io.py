@@ -100,7 +100,10 @@ def write_npz_array_stream(path: str | Path):
     """Context manager that accumulates per-batch arrays and writes a .npz file.
 
     Each call to write() accepts a list of metadata dicts and a dict of numpy
-    arrays for one batch. Arrays are concatenated along axis 0 at close time.
+    arrays for one batch. Per-batch arrays are immediately saved to temporary
+    .npy files so memory stays flat; at close time they are concatenated into
+    the final compressed .npz.
+
     Activations are stored as float16 to cut file size and write bandwidth;
     the read path upcasts back to float32.
     """
@@ -109,12 +112,15 @@ def write_npz_array_stream(path: str | Path):
 
     class _Stream:
         def __init__(self, out: Path):
-            self.out = out
+            self.out = Path(out)
             self.metadata: list[dict[str, Any]] = []
-            self.arrays: dict[str, list[Any]] = {}
+            self.temp_dir = self.out.with_suffix(".tmp")
+            self.temp_files: dict[str, list[Path]] = {}
+            self.batch_index = 0
 
         def __enter__(self):
             self.out.parent.mkdir(parents=True, exist_ok=True)
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
             return self
 
         def write(
@@ -122,15 +128,24 @@ def write_npz_array_stream(path: str | Path):
             metadata: list[dict[str, Any]],
             arrays: dict[str, Any],
         ) -> None:
+            import tempfile
+
             self.metadata.extend(metadata)
             for k, arr in arrays.items():
-                self.arrays.setdefault(k, []).append(arr)
+                tmp = self.temp_dir / f"{k}_batch{self.batch_index:06d}.npy"
+                np.save(tmp, arr)
+                self.temp_files.setdefault(k, []).append(tmp)
+            self.batch_index += 1
 
         def __exit__(self, exc_type, exc, tb):
+            import shutil
+
             if exc_type is not None:
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
                 return
             final_arrays: dict[str, Any] = {}
-            for k, parts in self.arrays.items():
+            for k, paths in self.temp_files.items():
+                parts = [np.load(p, mmap_mode="r") for p in paths]
                 stacked = np.concatenate(parts, axis=0)
                 # float16 keeps full dynamic range for activations; halves size.
                 if stacked.dtype == np.float32:
@@ -139,6 +154,7 @@ def write_npz_array_stream(path: str | Path):
             metadata_json = orjson.dumps(self.metadata, default=str)
             final_arrays["_metadata"] = np.frombuffer(metadata_json, dtype=np.uint8)
             np.savez_compressed(self.out, **final_arrays)
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     return _Stream(Path(path))
 
