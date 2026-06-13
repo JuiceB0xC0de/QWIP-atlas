@@ -124,7 +124,7 @@ def _build_layer_rows(
     batch_size = len(rows)
 
     # Bring the whole batch to CPU once, as float32.
-    # We do non-blocking copies when on CUDA, then a single synchronize.
+    # We do non-blocking copies via .to('cpu', non_blocking=True), then synchronize.
     use_cuda = mlp_hidden.device.type == "cuda"
     raw_tensors = {
         "gate": captured.get((layer, "gate_pre")),
@@ -136,12 +136,12 @@ def _build_layer_rows(
         "v_heads": captured.get((layer, "v")),
     }
 
-    mh_cpu = mlp_hidden.float().cpu(non_blocking=use_cuda)
+    mh_cpu = mlp_hidden.float().to("cpu", non_blocking=use_cuda)
     cpu_tensors = {"mlp_hidden": mh_cpu}
     for key, t in raw_tensors.items():
         if t is None:
             continue
-        cpu_tensors[key] = t.float().cpu(non_blocking=use_cuda)
+        cpu_tensors[key] = t.float().to("cpu", non_blocking=use_cuda)
     if use_cuda:
         torch.cuda.current_stream().synchronize()
 
