@@ -20,15 +20,18 @@ import numpy as np
 import orjson
 
 
-def finalize_layer(tmp_dir: Path, out_path: Path) -> tuple[Path, bool, str]:
+def finalize_layer(tmp_dir: Path, out_path: Path) -> tuple[Path, bool, str, float]:
     """Concatenate temp .npy files into one compressed .npz."""
+    import time
+
+    t0 = time.time()
     try:
         if not tmp_dir.exists():
-            return out_path, False, "no tmp dir"
+            return out_path, False, "no tmp dir", time.time() - t0
 
         npy_files = sorted(tmp_dir.glob("*_batch*.npy"))
         if not npy_files:
-            return out_path, False, "no temp files"
+            return out_path, False, "no temp files", time.time() - t0
 
         # Group files by field key.
         field_files: dict[str, list[Path]] = {}
@@ -52,15 +55,15 @@ def finalize_layer(tmp_dir: Path, out_path: Path) -> tuple[Path, bool, str]:
             final_arrays[key] = stacked
 
         if metadata is None:
-            return out_path, False, "missing metadata file"
+            return out_path, False, "missing metadata file", time.time() - t0
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(out_path, **final_arrays)
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        return out_path, True, f"{len(metadata)} rows"
+        return out_path, True, f"{len(metadata)} rows", time.time() - t0
 
     except Exception as exc:
-        return out_path, False, str(exc)
+        return out_path, False, str(exc), time.time() - t0
 
 
 def main():
@@ -77,20 +80,26 @@ def main():
         print("no .tmp directories found; nothing to finalize")
         return
 
-    print(f"finalizing {len(tmp_dirs)} layers from {root}")
+    print(f"finalizing {len(tmp_dirs)} layers from {root} with 8 workers")
+    print("(each dot is one layer completed)")
 
+    from tqdm import tqdm
+
+    completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = []
-        for tmp_dir in tmp_dirs:
-            out_path = tmp_dir.with_suffix("")
-            futures.append(pool.submit(finalize_layer, tmp_dir, out_path))
+        futures = {pool.submit(finalize_layer, tmp_dir, tmp_dir.with_suffix("")): tmp_dir for tmp_dir in tmp_dirs}
 
-        for fut in concurrent.futures.as_completed(futures):
-            out_path, ok, msg = fut.result()
-            status = "OK" if ok else "FAIL"
-            print(f"  [{status}] {out_path.name}: {msg}")
+        with tqdm(total=len(tmp_dirs), unit="layer", desc="finalize") as pbar:
+            for fut in concurrent.futures.as_completed(futures):
+                out_path, ok, msg, elapsed = fut.result()
+                status = "OK" if ok else "FAIL"
+                pbar.set_postfix({out_path.name: f"{elapsed:.1f}s"})
+                pbar.update(1)
+                if not ok:
+                    pbar.write(f"[FAIL] {out_path.name}: {msg}")
+                completed += 1
 
-    print("done")
+    print(f"done — {completed}/{len(tmp_dirs)} layers finalized")
 
 
 if __name__ == "__main__":

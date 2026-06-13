@@ -414,9 +414,22 @@ class streams_context:
         # concatenates, compresses, and writes — this is CPU/disk heavy and layers
         # are independent, so parallelizing gives a large wall-clock win.
         import concurrent.futures
+        import time
+
+        from tqdm import tqdm
 
         def _close_one(stream):
+            t0 = time.time()
             stream.__exit__(exc_type, exc, tb)
+            return time.time() - t0
 
+        print(f"[finalize] writing {len(self.streams)} compressed .npz files in parallel...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(self.streams), 8)) as pool:
-            pool.map(_close_one, self.streams.values())
+            futures = {pool.submit(_close_one, stream): name for name, stream in self.streams.items()}
+            with tqdm(total=len(self.streams), unit="layer", desc="finalize") as pbar:
+                for fut in concurrent.futures.as_completed(futures):
+                    name = futures[fut]
+                    elapsed = fut.result()
+                    pbar.set_postfix({f"l{name}": f"{elapsed:.1f}s"})
+                    pbar.update(1)
+        print("[finalize] done")
