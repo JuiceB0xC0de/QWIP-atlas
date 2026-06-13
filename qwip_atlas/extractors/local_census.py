@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Any
 
 from qwip_atlas.config import AtlasRunConfig
@@ -50,7 +51,7 @@ def _load_model_and_tokenizer(cfg: AtlasRunConfig, hf_token: str | None):
         "revision": model_spec.revision,
         "trust_remote_code": model_spec.trust_remote_code,
         "token": hf_token,
-        "dtype": _torch_dtype(model_spec.dtype),
+        "torch_dtype": _torch_dtype(model_spec.dtype),
     }
     if model_spec.device_map:
         kwargs["device_map"] = model_spec.device_map
@@ -68,12 +69,13 @@ def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, s
     def make_hook(layer: int, key: str, take_input: bool = False):
         if take_input:
             def _hook(module, inputs):
-                captured[(layer, key)] = inputs[0].detach().float().cpu()
+                # Keep on GPU; bulk transfer after forward pass.
+                captured[(layer, key)] = inputs[0].detach()
             return _hook
 
         def _hook(module, inputs, output):
             x = output[0] if isinstance(output, tuple) else output
-            captured[(layer, key)] = x.detach().float().cpu()
+            captured[(layer, key)] = x.detach()
         return _hook
 
     for layer, info in per_layer_info.items():
@@ -102,47 +104,28 @@ def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, s
     return handles
 
 
-def _row_from_capture(
-    *,
-    row: dict[str, Any],
-    record_idx: int,
-    seq_len: int,
+def _build_layer_rows(
     layer: int,
     info: dict,
     captured: dict[tuple[int, str], Any],
-    batch_index: int,
+    rows: list[dict[str, Any]],
+    seq_lens: list[int],
     cfg: AtlasRunConfig,
-) -> dict[str, Any] | None:
+) -> list[dict[str, Any]]:
+    import numpy as np
     import torch
 
     mlp_hidden = captured.get((layer, "mlp_hidden"))
     if mlp_hidden is None:
-        return None
+        return []
 
-    act_fn = info["mlp"]["act_fn"] or torch.nn.functional.silu
+    act_fn = info["mlp"].get("act_fn") or torch.nn.functional.silu
     head_dim = info["attn"]["head_dim"]
-    batch_size, _, _ = mlp_hidden.shape
-    sl = slice(-seq_len, None)
-    mh = mlp_hidden[batch_index, sl]
+    batch_size = len(rows)
 
-    out = {
-        "id": row.get("id", f"p{record_idx:06d}"),
-        "bucket": _bucket_for(row, cfg.corpus.category_key, cfg.corpus.bucket_key),
-        "category": row.get(cfg.corpus.category_key, ""),
-        "subcategory": row.get("subcategory", ""),
-        "prompt": row[cfg.corpus.prompt_key],
-        "is_contrast": row.get("is_contrast", False),
-        "contrast_pair_id": row.get("contrast_pair_id"),
-        "seq_len": int(seq_len),
-        "max_token_idx": int(mh.abs().sum(dim=-1).argmax().item()),
-        "last_token": mh[-1].numpy().tolist(),
-        "mean_tokens": mh.mean(0).numpy().tolist(),
-    }
-
-    # ⚡ Bolt Optimization:
-    # Previously, act_fn and reshape were applied to the entire batch O(batch_size) times.
-    # We now slice the tensor first, then apply expensive operations to only the needed slice.
-    components = cfg.components
+    # Bring the whole batch to CPU once, as float32.
+    # We do non-blocking copies when on CUDA, then a single synchronize.
+    use_cuda = mlp_hidden.device.type == "cuda"
     raw_tensors = {
         "gate": captured.get((layer, "gate_pre")),
         "up": captured.get((layer, "up")),
@@ -152,6 +135,24 @@ def _row_from_capture(
         "k_heads": captured.get((layer, "k")),
         "v_heads": captured.get((layer, "v")),
     }
+
+    mh_cpu = mlp_hidden.float().cpu(non_blocking=use_cuda)
+    cpu_tensors = {"mlp_hidden": mh_cpu}
+    for key, t in raw_tensors.items():
+        if t is None:
+            continue
+        cpu_tensors[key] = t.float().cpu(non_blocking=use_cuda)
+    if use_cuda:
+        torch.cuda.current_stream().synchronize()
+
+    mh = mh_cpu.numpy()
+    np_tensors = {k: v.numpy() for k, v in cpu_tensors.items() if k != "mlp_hidden"}
+
+    # Apply the MLP activation function once to the whole batch slice.
+    if "gate" in np_tensors:
+        np_tensors["gate"] = act_fn(torch.from_numpy(np_tensors["gate"])).numpy()
+
+    components = cfg.components
     key_to_component = {
         "gate": "gate",
         "up": "up",
@@ -162,31 +163,48 @@ def _row_from_capture(
         "v_heads": "v",
     }
 
-    for prefix, raw_tensor in raw_tensors.items():
-        if raw_tensor is None or key_to_component[prefix] not in components:
-            continue
+    out_rows = []
+    for batch_index, (row, seq_len) in enumerate(zip(rows, seq_lens)):
+        sl = slice(-int(seq_len), None)
+        mh_slice = mh[batch_index, sl]
 
-        # Slice first
-        t = raw_tensor[batch_index, sl]
+        out = {
+            "id": row.get("id", f"p{row.get('_record_idx', batch_index):06d}"),
+            "bucket": row.get("_bucket", "uncategorized"),
+            "category": row.get(cfg.corpus.category_key, ""),
+            "subcategory": row.get("subcategory", ""),
+            "prompt": row[cfg.corpus.prompt_key],
+            "is_contrast": row.get("is_contrast", False),
+            "contrast_pair_id": row.get("contrast_pair_id"),
+            "seq_len": int(seq_len),
+            "max_token_idx": int(np.abs(mh_slice).sum(axis=-1).argmax().item()),
+            "last_token": mh_slice[-1].tolist(),
+            "mean_tokens": mh_slice.mean(0).tolist(),
+        }
 
-        # Apply operations on the sliced tensor
-        if prefix == "gate":
-            t = act_fn(t)
-        elif prefix.endswith("_heads"):
-            if not head_dim or t.shape[-1] % head_dim != 0:
+        for prefix, np_tensor in np_tensors.items():
+            if key_to_component[prefix] not in components:
                 continue
-            t = t.reshape(t.shape[0], t.shape[-1] // head_dim, head_dim)
+            t = np_tensor[batch_index, sl]
+            if prefix.endswith("_heads"):
+                if not head_dim or t.shape[-1] % head_dim != 0:
+                    continue
+                t = t.reshape(t.shape[0], t.shape[-1] // head_dim, head_dim)
 
-        out[f"{prefix}_last"] = t[-1].numpy().tolist()
-        out[f"{prefix}_mean"] = t.mean(0).numpy().tolist()
+            out[f"{prefix}_last"] = t[-1].tolist()
+            out[f"{prefix}_mean"] = t.mean(0).tolist()
 
-    return out
+        out_rows.append(out)
+
+    return out_rows
 
 
 def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[int, int]:
     """Capture multi-layer activations into `l<N>_census_raw.json` files.
 
-    This is the model-agnostic, non-Modal replacement for the old `extract_multi.py`.
+    GPU-optimized: keeps tensors on GPU during the forward pass, transfers the
+    whole batch to CPU once, vectorizes per-layer slicing, and writes layer
+    streams in parallel threads.
     """
     import torch
     from tqdm import tqdm
@@ -239,10 +257,29 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
     }
     counts = {layer: 0 for layer in per_layer_info}
 
-    with streams_context(streams) as writers:
+    # Pre-bake per-row metadata so the hot loop is pure tensor work.
+    base_rows = [
+        {
+            "_record_idx": i,
+            "_bucket": _bucket_for(row, cfg.corpus.category_key, cfg.corpus.bucket_key),
+            cfg.corpus.category_key: row.get(cfg.corpus.category_key, ""),
+            "subcategory": row.get("subcategory", ""),
+            cfg.corpus.prompt_key: row[cfg.corpus.prompt_key],
+            "is_contrast": row.get("is_contrast", False),
+            "contrast_pair_id": row.get("contrast_pair_id"),
+            "id": row.get("id"),
+        }
+        for i, row in enumerate(corpus)
+    ]
+
+    # One executor for the whole run. We parallelize the CPU-heavy row slicing
+    # across layers; JSON writes stay in the main thread to avoid stream corruption.
+    max_workers = min(len(per_layer_info), 8)
+
+    with streams_context(streams) as writers, concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         for start in tqdm(range(0, len(corpus), cfg.batch_size), desc="batches", unit="batch"):
-            batch = corpus[start:start + cfg.batch_size]
-            prompts = [row[cfg.corpus.prompt_key] for row in batch]
+            batch_rows = base_rows[start:start + cfg.batch_size]
+            prompts = [row[cfg.corpus.prompt_key] for row in batch_rows]
             enc = tokenizer(
                 prompts,
                 return_tensors="pt",
@@ -261,23 +298,29 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
             for handle in handles:
                 handle.remove()
 
-            for layer, info in per_layer_info.items():
-                for batch_index, (row, seq_len) in enumerate(zip(batch, seq_lens)):
-                    out = _row_from_capture(
-                        row=row,
-                        record_idx=start + batch_index,
-                        seq_len=int(seq_len),
-                        layer=layer,
-                        info=info,
-                        captured=captured,
-                        batch_index=batch_index,
-                        cfg=cfg,
-                    )
-                    if out is not None:
-                        writers[layer].write(out)
-                        counts[layer] += 1
+            # Build all layer rows in parallel (CPU-bound numpy/tensor slicing).
+            def _build_for_layer(layer):
+                return layer, _build_layer_rows(
+                    layer=layer,
+                    info=per_layer_info[layer],
+                    captured=captured,
+                    rows=batch_rows,
+                    seq_lens=seq_lens,
+                    cfg=cfg,
+                )
+
+            layer_rows = dict(pool.map(_build_for_layer, per_layer_info.keys()))
+
+            # Write sequentially so the JSON streams stay consistent.
+            for layer in per_layer_info:
+                writer = writers[layer]
+                for out in layer_rows[layer]:
+                    writer.write(out)
+                counts[layer] += len(layer_rows[layer])
 
             captured.clear()
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
 
     print(f"[extract] wrote: {counts}")
     return counts
