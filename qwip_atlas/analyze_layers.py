@@ -41,7 +41,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 
-from qwip_atlas.io import read_json, write_json
+from qwip_atlas.io import read_census, write_json
 
 
 def _ensure_census(input_path: Path, layer: int) -> None:
@@ -84,7 +84,7 @@ def load_census(path: str):
       records:    list of metadata dicts
     Components missing from the file are silently skipped.
     """
-    records = read_json(path)
+    records = read_census(path)
     if not records:
         raise SystemExit(
             f"No census records found in {path}. "
@@ -713,7 +713,12 @@ def main():
     args = parser.parse_args()
 
     if args.input is None:
-        args.input = f"l{args.layer}_census_raw.json"
+        # Default to .npz; fallback to .json if .npz doesn't exist.
+        npz_path = Path(f"l{args.layer}_census_raw.npz")
+        if npz_path.exists():
+            args.input = str(npz_path)
+        else:
+            args.input = f"l{args.layer}_census_raw.json"
 
     _ensure_census(Path(args.input), args.layer)
 

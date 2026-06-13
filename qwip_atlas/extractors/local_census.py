@@ -4,7 +4,7 @@ import concurrent.futures
 from typing import Any
 
 from qwip_atlas.config import AtlasRunConfig
-from qwip_atlas.io import iter_jsonl, write_json_array_stream
+from qwip_atlas.io import iter_jsonl, write_npz_array_stream
 from qwip_atlas.layers import inspect_layer, layers_container, resolve_layers
 
 
@@ -252,7 +252,7 @@ def run_local_census(cfg: AtlasRunConfig, hf_token: str | None = None) -> dict[i
 
     cfg.outdir.mkdir(parents=True, exist_ok=True)
     streams = {
-        layer: write_json_array_stream(cfg.outdir / f"l{layer}_census_raw.json")
+        layer: write_npz_array_stream(cfg.outdir / f"l{layer}_census_raw.npz")
         for layer in per_layer_info
     }
     counts = {layer: 0 for layer in per_layer_info}
